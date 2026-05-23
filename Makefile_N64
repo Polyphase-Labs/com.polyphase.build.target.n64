@@ -1,0 +1,408 @@
+# Makefile_N64 — Polyphase N64 build, Phase 1 (engine compiles + boots).
+#
+# Single-pass build: compiles the engine source tree + N64 addon runtime +
+# the project's own source into one mips64-elf ELF, then wraps it into a
+# `.z64` ROM with n64tool + chksum64. Mirrors the PSP Makefile layout but
+# adapted for libdragon + mips64-elf-gcc.
+#
+# Run via the editor's N64 build-target addon (which routes through native
+# cmd on Windows OR `wsl bash -lc` if "Use WSL" is enabled), OR manually:
+#
+#   make -C <projectDir>/Intermediate/N64 -f <addon>/Makefile_N64 \
+#        PROJECT_ROOT=<projectDir> POLYPHASE_PATH=<engineDir>
+#
+# Requires libdragon installed and `$N64_INST/bin` reachable. Native
+# Windows just needs PATH set; WSL needs the libdragon toolchain inside
+# WSL at /opt/libdragon (the default) or wherever N64_INST points.
+
+# If a compile recipe fails or is interrupted (Ctrl-C, OOM-kill, pipe
+# break, parallel-job cancel), GNU make would otherwise leave a 0-byte .o
+# on disk. That stub then satisfies the next build's freshness check, so
+# make skips the compile and the link silently succeeds — but the .o
+# defines no symbols, producing baffling "undefined reference to ..."
+# errors at link time. Deleting partial outputs on failure prevents the
+# whole class of bug.
+.DELETE_ON_ERROR:
+
+# ----- PROJECT_ROOT resolution -----------------------------------------------
+# PROJECT_ROOT — absolute path to the user's project. Resolution priority:
+#   1. Set on the make command line by the N64 addon's GetCompileCommand
+#      (normal path). Make is run from $(PROJECT_ROOT)/Intermediate/N64/.
+#   2. Walk-up from $(CURDIR) looking for a *.octp marker.
+ifeq ($(origin PROJECT_ROOT), undefined)
+PROJECT_ROOT := $(strip \
+    $(if $(wildcard $(CURDIR)/*.octp),         $(CURDIR), \
+    $(if $(wildcard $(CURDIR)/../*.octp),      $(abspath $(CURDIR)/..), \
+    $(if $(wildcard $(CURDIR)/../../*.octp),   $(abspath $(CURDIR)/../..), \
+                                                ))))
+endif
+
+ifeq ($(strip $(PROJECT_ROOT)),)
+$(error Could not locate project root — no *.octp file found within 2 levels \
+  of $(CURDIR). Pass PROJECT_ROOT=/path/to/project on the make line.)
+endif
+
+# Strip trailing slash. GNU make's $(notdir foo/) returns empty (notdir
+# splits on the final '/'), so a trailing-slash PROJECT_ROOT would yield
+# TARGET="" → $(TARGET).elf = ".elf" → link silently produces a 0-byte ROM.
+# `override` is REQUIRED because PROJECT_ROOT is set on the make command line
+# and `:=` reassignment would be silently ignored without it.
+override PROJECT_ROOT := $(patsubst %/,%,$(PROJECT_ROOT))
+
+ifeq ($(wildcard $(PROJECT_ROOT)/*.octp),)
+$(error Resolved PROJECT_ROOT='$(PROJECT_ROOT)' but it has no *.octp file. \
+  Pass PROJECT_ROOT explicitly on the make line.)
+endif
+
+TARGET := $(notdir $(PROJECT_ROOT))
+
+# ----- N64_INST resolution ---------------------------------------------------
+# libdragon convention. Default to /opt/libdragon (canonical install dir on
+# Linux/WSL). On native Windows the addon's GetCompileCommand passes
+# N64_INST=C:/libdragon on the make line.
+ifeq ($(strip $(N64_INST)),)
+N64_INST_CANDIDATES := /opt/libdragon /usr/local/libdragon $(HOME)/libdragon /mnt/c/libdragon C:/libdragon
+N64_INST := $(firstword $(foreach d,$(N64_INST_CANDIDATES),$(if $(wildcard $(d)/bin/n64tool),$(d))$(if $(wildcard $(d)/bin/n64tool.exe),$(d))))
+ifeq ($(strip $(N64_INST)),)
+N64_INST := /opt/libdragon
+endif
+endif
+override N64_INST := $(patsubst %/,%,$(N64_INST))
+
+# Fail loudly if libdragon isn't present at N64_INST. The check uses
+# libdragon.a (the runtime library) — gcc alone isn't enough.
+ifeq ($(wildcard $(N64_INST)/mips64-elf/lib/libdragon.a),)
+$(error libdragon not built/installed at '$(N64_INST)'. Either set N64_INST \
+  to your install prefix, or build libdragon: \
+  `git clone https://github.com/DragonMinded/libdragon && cd libdragon && N64_INST=$(N64_INST) ./build.sh`)
+endif
+
+# Toolchain — mips64-elf-gcc + binutils ship under $N64_INST/bin.
+# Export PATH so any recursive sub-make invocations find them. The addon's
+# WrapShell ALREADY prepends N64_INST/bin to PATH on Windows native, but
+# repeating it here defends against manual `make` invocations.
+export PATH := $(N64_INST)/bin:$(PATH)
+
+CC      := mips64-elf-gcc
+CXX     := mips64-elf-g++
+LD      := mips64-elf-gcc
+AR      := mips64-elf-ar
+OBJCOPY := mips64-elf-objcopy
+N64TOOL := n64tool
+CHKSUM  := chksum64
+
+# ----- POLYPHASE_PATH resolution ---------------------------------------------
+POLYPHASE_PATH ?= $(shell \
+    p=$(PROJECT_ROOT); \
+    for i in 1 2 3 4 5 6; do \
+        p=$$(dirname $$p); \
+        if [ -f $$p/Polyphase.sln ]; then echo $$p; exit 0; fi; \
+    done; \
+    echo /opt/Polyphase )
+override POLYPHASE_PATH := $(patsubst %/,%,$(POLYPHASE_PATH))
+
+ifeq ($(wildcard $(POLYPHASE_PATH)/Engine/Source/Engine/Engine.h),)
+$(error POLYPHASE_PATH='$(POLYPHASE_PATH)' does not contain Engine/Source/Engine/Engine.h. \
+  Pass POLYPHASE_PATH=/path/to/polyphase-engine on the make command line. \
+  Inside WSL, Windows-side paths look like /mnt/<drive>/path/to/engine.)
+endif
+
+ADDON_N64_RUNTIME := $(PROJECT_ROOT)/Packages/com.polyphase.build.target.n64/Runtime/N64
+
+# ----- ROM metadata ----------------------------------------------------------
+# Filled by the addon's GetCompileCommand from profile options. Defaults
+# here are only used when invoking make manually.
+N64_ROM_TITLE  ?= Polyphase Game
+N64_ROM_REGION ?= NTSC
+# ROM padding size, NOT the RAM ceiling. N64 cart ROMs go up to 64 MiB,
+# but emulator ISViewer support has caveats — ares disables ISViewer
+# entirely when the ROM is >32 MiB because the ISViewer MMIO range
+# (0x13FF_0000-ish on the PI bus) overlaps cart ROM space at that size.
+# Stay at 32M by default so ISViewer logs work for development; users
+# with engine+assets exceeding 32M can override via the build profile
+# and accept losing emulator log capture.
+# (Compressed ELF size for a typical Phase 1 Polyphase engine is ~6-12
+# MB, well under the 32M ceiling.)
+N64_ROM_SIZE   ?= 32M
+
+# ----- Engine-native addon injection ----------------------------------------
+# The editor writes $(PROJECT_ROOT)/Generated/AddonInject.mk right before
+# invoking GetCompileCommand. It DEFINES ADDON_* variables that this
+# Makefile substitutes into its own SOURCES / CFLAGS / etc., so other
+# engine-target addons compile into the N64 build alongside the engine.
+# `-include` is non-fatal — first build without addons still works.
+-include $(PROJECT_ROOT)/Generated/AddonInject.mk
+
+# ----- Source discovery ------------------------------------------------------
+# Same subsystem layout as Makefile_PSP. Each directory listed gets globbed
+# by the OBJS expansion below. Adding a new file to one of these dirs is
+# transparent — make picks it up on the next build.
+SOURCES := \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Assets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Animation \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/3D \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/Widgets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Domains \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/UI \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline/Tracks \
+    $(POLYPHASE_PATH)/Engine/Source/Plugins \
+    $(POLYPHASE_PATH)/Engine/Source/System \
+    $(POLYPHASE_PATH)/Engine/Source/Graphics \
+    $(POLYPHASE_PATH)/Engine/Source/Input \
+    $(POLYPHASE_PATH)/Engine/Source/Audio \
+    $(POLYPHASE_PATH)/Engine/Source/Network \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http/Backends \
+    $(POLYPHASE_PATH)/Engine/Source/Serial/Stub \
+    $(POLYPHASE_PATH)/Engine/Source/LuaBindings \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/IrrXML \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/BroadphaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionDispatch \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionShapes \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/Gimpact \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/NarrowPhaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Character \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/ConstraintSolver \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Dynamics \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Featherstone \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/MLCPSolvers \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Vehicle \
+    $(POLYPHASE_PATH)/External/Bullet/LinearMath \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Source \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Source \
+    $(ADDON_N64_RUNTIME) \
+    $(ADDON_N64_RUNTIME)/Graphics_N64RDP \
+    $(ADDON_N64_RUNTIME)/Compat \
+    $(PROJECT_ROOT)/Source \
+    $(ADDON_SOURCES)
+
+# ----- Include path ----------------------------------------------------------
+INCDIR := \
+    $(PROJECT_ROOT)/Generated \
+    $(ADDON_N64_RUNTIME) \
+    $(ADDON_N64_RUNTIME)/Graphics_N64RDP \
+    $(POLYPHASE_PATH)/Engine/Source \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/External \
+    $(POLYPHASE_PATH)/External/Bullet \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/glm \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/Assimp/contrib/rapidjson \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Include \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Include \
+    $(POLYPHASE_PATH)/Engine/External/PolyVox/include \
+    $(N64_INST)/mips64-elf/include \
+    $(N64_INST)/include \
+    $(ADDON_INCDIR)
+
+# ----- Object list -----------------------------------------------------------
+# Glob every .cpp / .c under each SOURCES dir → flat-basename .o in CWD,
+# with VPATH telling make where to find the original source. Two source
+# files with the same basename in different dirs would collide; the
+# engine's subsystem-level files use distinct names so this works.
+CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+
+# Pull EmbeddedScripts.cpp (Lua source text) if generated. Do NOT pull
+# EmbeddedAssets.cpp — N64 has 4–8 MB total RAM, blowing the budget on
+# cooked asset bytes makes no sense. Assets live in DragonFS at runtime.
+ifneq ($(wildcard $(PROJECT_ROOT)/Generated/EmbeddedScripts.cpp),)
+CPPFILES += EmbeddedScripts.cpp
+endif
+
+CPPFILES += $(ADDON_CPPFILES_EXTRA)
+
+VPATH := $(SOURCES) $(PROJECT_ROOT)/Generated
+OBJS  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
+
+# ----- Flags -----------------------------------------------------------------
+DEFINES := \
+    -DPOLYPHASE_PLATFORM_ADDON=1 \
+    -DPLATFORM_N64=1 \
+    -DAPI_T3D=1 \
+    -DEDITOR=0 \
+    -DLUA_ENABLED=1 \
+    -DGLM_FORCE_RADIANS \
+    -DLOGGING_ENABLED=1 \
+    $(ADDON_DEFINES)
+ifeq ($(strip $(N64_EXPANSION_PAK)),1)
+DEFINES += -DN64_EXPANSION_PAK=1
+endif
+
+# libdragon's official toolchain flags (from its bundled n64.mk):
+#   -march=vr4300 -mtune=vr4300  — N64 CPU model + scheduling
+#   -mabi=eabi                   — Embedded ABI; libdragon.a / libdragonsys.a
+#                                  / its libc.a / libstdc++.a are ALL built
+#                                  with this. Mixing O32 (`-mabi=32`) here
+#                                  produces "ABI mismatch: linking O32
+#                                  module with previous O64 modules" at
+#                                  link time.
+#   -mlong-double-64             — long double = double (no 80/128-bit
+#                                  long-double on N64 — matches the libs).
+#   -mfix4300                    — VR4300 errata workaround. Not strictly
+#                                  required but enabled in every libdragon
+#                                  example; leaving it out can produce code
+#                                  that hits the VR4300 div-by-zero hang.
+# -ffunction-sections / -fdata-sections + -Wl,--gc-sections strips unused
+# symbols, critical on a 4–8 MB target.
+# -fno-exceptions / -fno-rtti is mandatory — libdragon's newlib doesn't
+# ship the unwinder / RTTI tables.
+# -G0 forces global pointer relocations to not use $gp small-data
+# addressing (which would otherwise overflow the 64 KB sdata window when
+# the engine's many globals exceed it).
+CFLAGS_COMMON := -O2 -G0 -march=vr4300 -mtune=vr4300 -mabi=o64 \
+                 -mfix4300 \
+                 -ffunction-sections -fdata-sections \
+                 -Wall -Wno-unused-parameter -Wno-unused-variable \
+                 -Wno-unused-but-set-variable -Wno-sign-compare \
+                 -D_FORTIFY_SOURCE=0 \
+                 $(DEFINES) \
+                 $(addprefix -I,$(INCDIR))
+
+# Force-include the C++ threading stub before every C++ TU. libdragon's
+# libstdc++ ships without thread support, so engine code that uses
+# std::mutex / std::atomic<bool> / std::lock_guard / std::thread otherwise
+# fails to compile. The stub provides no-op implementations of these types
+# inside `namespace std` so the type-system requirements are met without
+# touching every engine source file. See StdThreadingStub.h for context.
+# Applies only to C++ — C TUs don't need it.
+CXX_FORCE_INCLUDES := -include $(ADDON_N64_RUNTIME)/Compat/StdThreadingStub.h
+
+CFLAGS   := $(CFLAGS_COMMON) -std=gnu11
+# -fpermissive downgrades-to-warning the pointer-precision errors C++ emits
+# when libdragon's C-shaped <rdpq.h> / <libdragon.h> inline functions cast
+# `void*` to phys_addr_t (uint32_t). Pointers are 32-bit on EABI so the
+# cast is in fact safe; C is happy with it but C++ insists it "loses
+# precision" because the compiler models `void*` as 64-bit type-wise.
+CXXFLAGS := $(CFLAGS_COMMON) -std=gnu++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics -fpermissive $(CXX_FORCE_INCLUDES)
+ASFLAGS  := $(CFLAGS_COMMON)
+
+# ----- Libraries -------------------------------------------------------------
+# libdragon's core (libdragon.a) wraps the OS abstraction, RDP/RSP queues,
+# DragonFS, controller, audio mixer, etc. libdragonsys is the C library
+# integration (newlib syscall stubs).
+# libm + libstdc++ provide math + C++ runtime. libstdc++ is the small
+# "freestanding" variant since -fno-exceptions/-fno-rtti is on.
+# libt3d (Tiny3D) is Phase 3+ — add to LIBS once the vendored build is
+# wired into the Makefile. Phase 1 stays bare-bones to confirm boot.
+LIBDIR := $(N64_INST)/mips64-elf/lib $(ADDON_LIBDIR)
+
+# Link with --start-group/--end-group to resolve circular references between
+# libstdc++ (which needs libc's wide-char routines and ctype tables) and
+# libc (which is happy to live without libstdc++ but mips64-elf-ld walks
+# the lib list strictly left-to-right by default and misses backwards refs).
+#
+# The libgcc soft-math helpers (`__clzsi2` for count-leading-zeros on mips3
+# which has no `clz` instruction, `__divdi3`/`__udivdi3` for 64-bit signed/
+# unsigned int division on 32-bit-ABI MIPS) aren't pulled in by a plain
+# `-lgcc` inside the group — the linker only searches a library when it's
+# already found at least one unresolved symbol referenced from a prior
+# object, and gcc's libgcc handling is funky under `-mabi=32`. The
+# bulletproof fix is `-Wl,-u,<symbol>` which marks the symbol as
+# "undefined-required" before any libraries are walked, guaranteeing
+# the libgcc.a member that defines it gets linked in.
+LIBS := \
+    -Wl,-u,__clzsi2 -Wl,-u,__divdi3 -Wl,-u,__udivdi3 \
+    -Wl,--start-group \
+    -ldragon -ldragonsys -lstdc++ -lm -lc -lgcc \
+    $(ADDON_LIBS) \
+    -Wl,--end-group
+
+# Linker script ships with libdragon. -Wl,--gc-sections trims dead code
+# (essential on this tight RAM budget). --allow-multiple-definition
+# defends against libdragon's libc/newlib symbol overlaps.
+LDFLAGS := -T$(N64_INST)/mips64-elf/lib/n64.ld \
+           -Wl,--gc-sections \
+           -Wl,--allow-multiple-definition \
+           -Wl,--wrap=__do_global_ctors \
+           $(addprefix -L,$(LIBDIR))
+# --wrap=__do_global_ctors — libdragon hijacks the C++ static-ctor pass
+# (it needs to run them AFTER its own RDRAM/heap init, not in the
+# default libstdc++ order). Without this wrap, ctors execute before the
+# heap is up and any `new` in a static initializer faults. Copied
+# verbatim from libdragon's own n64.mk LDFLAGS.
+
+# ----- Rules -----------------------------------------------------------------
+all: stage
+
+# ELF link — produces $(TARGET).elf in CWD (= $(PROJECT_ROOT)/Intermediate/N64/).
+$(TARGET).elf: $(OBJS)
+	@echo "[LD] $@"
+	@$(LD) -o $@ $(OBJS) $(LDFLAGS) $(LIBS)
+
+# Per-source compile rules. Match .cpp / .c separately so the right
+# CFLAGS variant applies.
+%.o: %.cpp
+	@echo "[CXX] $<"
+	@$(CXX) $(CXXFLAGS) -c $< -o $@
+
+%.o: %.c
+	@echo "[CC] $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.S
+	@echo "[AS] $<"
+	@$(CC) $(ASFLAGS) -c $< -o $@
+
+# Stage: produce a .z64 ROM at $(PROJECT_ROOT)/Build/N64/$(TARGET).z64.
+#
+# n64tool builds the ROM from a header + binary payload. The header file
+# ships under $(N64_INST)/mips64-elf/lib/header (a 64-byte boot stub).
+# -l $(N64_ROM_SIZE) pads the ROM to a power-of-two size. -t embeds the
+# title into the header (max 20 ASCII chars).
+#
+# If a DragonFS image exists at Build/N64/$(TARGET).dfs (built by a
+# separate cook pass in a future phase), it's appended to the ROM at
+# offset 1MB so the runtime can mount it via dfs_init().
+#
+# chksum64 patches the ROM's CIC checksum bytes so real N64 hardware
+# accepts it. (Most emulators don't enforce this, but flashcarts do.)
+stage: $(TARGET).elf
+	@mkdir -p $(PROJECT_ROOT)/Build/N64
+	@# Follow libdragon V2's canonical ROM-build sequence (cf.
+	@# $(N64_INST)/include/n64.mk's %.z64 recipe):
+	@#   1. Generate symbol table via n64sym (from UNSTRIPPED ELF) so
+	@#      libdragon's crash handler can symbolicate backtraces. Without
+	@#      this, panics show raw addresses with "no symbol table" message.
+	@#   2. Strip the ELF (remove unused symbols — keeps the cart small).
+	@#   3. Compress via n64elfcompress (libdragon's bootloader expects
+	@#      a compressed ELF payload — `-c 1` is the default compression
+	@#      level). Overwrites the stripped file in place.
+	@#   4. n64tool with --toc + --align 256 — the Table of Contents is
+	@#      what libdragon's stage-2 bootloader reads to locate the ELF
+	@#      inside the ROM. Symbol table goes in at --align 8 so the
+	@#      crash handler can read it via the rompak.
+	@echo "[N64SYM] $(TARGET).elf.sym"
+	@$(N64_INST)/bin/n64sym $(TARGET).elf $(TARGET).elf.sym
+	@echo "[STRIP] $(TARGET).elf.stripped"
+	@cp $(TARGET).elf $(TARGET).elf.stripped
+	@mips64-elf-strip -s $(TARGET).elf.stripped
+	@echo "[ELFCOMPRESS] $(TARGET).elf.stripped"
+	@$(N64_INST)/bin/n64elfcompress -o . -c 1 $(TARGET).elf.stripped
+	@echo "[N64TOOL] $(PROJECT_ROOT)/Build/N64/$(TARGET).z64"
+	@$(N64TOOL) --title "$(N64_ROM_TITLE)" \
+	            -l $(N64_ROM_SIZE) \
+	            --toc \
+	            --output $(PROJECT_ROOT)/Build/N64/$(TARGET).z64 \
+	            --align 256 $(TARGET).elf.stripped \
+	            --align 8 $(TARGET).elf.sym \
+	            $(if $(wildcard $(PROJECT_ROOT)/Build/N64/$(TARGET).dfs), --align 16 $(PROJECT_ROOT)/Build/N64/$(TARGET).dfs,)
+	@echo "Staged $(PROJECT_ROOT)/Build/N64/$(TARGET).z64"
+
+clean:
+	@rm -f *.o *.d *.elf *.bin
+	@echo "Cleaned intermediates."
+
+cleanstage:
+	@rm -rf $(PROJECT_ROOT)/Build/N64
+	@echo "Cleaned staged ROM."
+
+.PHONY: all stage clean cleanstage

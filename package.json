@@ -1,0 +1,22 @@
+{
+    "name": "com.polyphase.build.target.n64",
+    "author": "Justin Jaro",
+    "description": "Nintendo 64 (libdragon) build target for the Polyphase Engine.",
+    "version": "1.0.0",
+    "native": {
+        "target": "editor",
+        "sourceDir": "Source",
+        "binaryName": "com.polyphase.build.target.n64",
+        "entrySymbol": "PolyphasePlugin_GetDesc",
+        "apiVersion": 4,
+        "resolveMode": "source",
+        "binaries": [],
+        "buildTargets": [
+            {
+                "id": "homebrew.n64",
+                "displayName": "Nintendo 64 (libdragon)",
+                "category": "Retro Consoles"
+            }
+        ]
+    }
+}
