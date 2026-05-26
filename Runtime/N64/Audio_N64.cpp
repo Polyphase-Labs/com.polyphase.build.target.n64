@@ -1,18 +1,4 @@
-/**
- * @file Audio_N64.cpp
- * @brief N64 audio — Phase 1 silent stub.
- *
- * Phase 1: all AUD_* functions are no-op stubs that keep the engine
- * linking. The engine's audio paths (sound emitter nodes, music players,
- * video-player streaming, etc.) all degrade gracefully when AUD_IsPlaying
- * returns false consistently.
- *
- * Phase 4: real implementation via libdragon's audio_init + mixer.
- * libdragon's mixer ships out of the box with the SDK and uses N64's
- * AI (audio interface) with a pull-style buffer queue. The shape would
- * mirror Audio_PSP.cpp — a software mixer with a voice table, drained
- * each frame inside AUD_Update.
- */
+// Silent stub. Real implementation will wire libdragon's mixer.
 
 #if defined(POLYPHASE_PLATFORM_ADDON)
 
@@ -21,7 +7,7 @@
 #include "Engine/Assets/SoundWave.h"
 #include "Log.h"
 
-#include <libdragon.h>  // debugf macro
+#include <libdragon.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -51,8 +37,6 @@ void AUD_SetPitch(uint32_t /*voiceIndex*/, float /*pitch*/) {}
 
 uint8_t* AUD_AllocWaveBuffer(uint32_t size)
 {
-    // Engine callers expect a heap allocation matching free-by-AUD_FreeWaveBuffer.
-    // Use malloc directly (not memalign) — Phase 4's mixer will rewrite.
     return (uint8_t*)std::malloc(size);
 }
 
@@ -65,13 +49,13 @@ void AUD_ProcessWaveBuffer(SoundWave* /*soundWave*/) {}
 
 uint32_t AUD_OpenStream(uint32_t /*sampleRate*/, uint32_t /*numChannels*/, uint32_t /*bitsPerSample*/)
 {
-    return 0; // signal "open failed" so video-player consumers fall back to silence
+    return 0;
 }
 
 void     AUD_CloseStream(uint32_t /*streamId*/) {}
 int32_t  AUD_SubmitStreamBuffer(uint32_t /*streamId*/, const uint8_t* /*data*/, uint32_t /*byteSize*/)
 {
-    return 0; // 0 = "queue full, retry" — caller will keep trying, harmless.
+    return 0;
 }
 uint64_t AUD_GetStreamPlayedSamples(uint32_t /*streamId*/) { return 0; }
 void     AUD_SetStreamVolume(uint32_t /*streamId*/, float /*volume*/) {}

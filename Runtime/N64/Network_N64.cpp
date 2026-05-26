@@ -1,22 +1,11 @@
-/**
- * @file Network_N64.cpp
- * @brief N64 network stub. Stock N64 hardware has no network — the only
- *        accessories that ever provided one (Modem Pak, 64DD, RandNet) are
- *        either unsupported in libdragon or rare hardware that doesn't
- *        warrant a runtime path here.
- *
- * Every NET_* function reports "no network" — sockets fail to create,
- * sends/receives error, IP lookup returns 0. The engine's higher layers
- * (NetDatum sync, multiplayer scenes, HTTP, etc.) gate themselves on
- * NET_IsActive() returning false and degrade to single-player gracefully.
- */
+// No-network stub. Stock N64 hardware has no networking.
 
 #if defined(POLYPHASE_PLATFORM_ADDON)
 
 #include "Network/Network.h"
 #include "Log.h"
 
-#include <libdragon.h>  // debugf macro
+#include <libdragon.h>
 
 #include <cstdint>
 #include <cstring>
