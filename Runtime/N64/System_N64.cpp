@@ -114,11 +114,33 @@ void SYS_SetWorkingDirectory(const std::string& /*dirPath*/) {}
 // SD card driver if mounted (libdragon flashcart support).
 // =========================================================================
 
+namespace
+{
+    // Engine paths look like "<projectName>/Assets/Foo.oct" — relative
+    // strings without a libdragon-style filesystem prefix. libdragon's
+    // newlib routes file ops by prefix: "rom:/..." → DragonFS, "sd:/..."
+    // → SD card driver, anything else → uninitialized. We prepend "rom:/"
+    // so the engine's flat paths resolve into the DFS image bundled into
+    // the cart by PostPackage.
+    inline std::string ToRomPath(const char* path)
+    {
+        if (path == nullptr || path[0] == '\0') return std::string();
+        if (std::strncmp(path, "rom:",  4) == 0) return std::string(path);
+        if (std::strncmp(path, "sd:",   3) == 0) return std::string(path);
+        // Strip a leading "./" if present so we don't get "rom:/./X".
+        if (path[0] == '.' && path[1] == '/') path += 2;
+        std::string out = "rom:/";
+        out += path;
+        return out;
+    }
+}
+
 bool SYS_DoesFileExist(const char* path, bool /*isAsset*/)
 {
     if (path == nullptr) return false;
+    const std::string p = ToRomPath(path);
     struct stat st;
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+    return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
 void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
@@ -128,10 +150,11 @@ void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
     outSize = 0;
     if (path == nullptr) return;
 
-    FILE* f = std::fopen(path, "rb");
+    const std::string p = ToRomPath(path);
+    FILE* f = std::fopen(p.c_str(), "rb");
     if (f == nullptr)
     {
-        LogWarning("SYS_AcquireFileData: fopen failed for '%s'", path);
+        LogWarning("SYS_AcquireFileData: fopen failed for '%s' (rom path: '%s')", path, p.c_str());
         return;
     }
 
@@ -182,29 +205,106 @@ void SYS_RemoveDirectory(const char* dirPath)
     (void)dirPath;
 }
 
-// Phase 1 stubs. libdragon's newlib has no <dirent.h>; DragonFS uses its
-// own dir_findfirst / dir_findnext API. Engine asset discovery on N64
-// runs from embedded scripts only at this stage, so a no-op iterator is
-// sufficient — every call to SYS_OpenDirectory immediately reports an
-// invalid entry and the engine's discovery loop bails cleanly.
+// Directory iteration via libdragon's DragonFS dir API.
+//
+//   dir_findfirst(path, &dir) — populates dir.d_name with first entry
+//   dir_findnext(path, &dir)  — populates dir.d_name with next entry
+//   d_type field: DT_REG (regular file) | DT_DIR (subdirectory)
+//
+// libdragon's dir_t lives in <libdragon.h>. We allocate one off the heap
+// per open directory and stash the pointer in DirEntry::mDirHandle
+// (already typed as void* via SystemTypes_Platform.h). The directory
+// path is captured too so dir_findnext can re-use it.
+
+namespace
+{
+    struct N64DirIter
+    {
+        dir_t       mDir;
+        std::string mPath;
+        bool        mPrimed = false; // first findfirst result already loaded
+    };
+}
+
 void SYS_OpenDirectory(const std::string& dirPath, DirEntry& outDirEntry)
 {
-    debugf("[SYS] SYS_OpenDirectory('%s') -> stub invalid\n", dirPath.c_str());
     outDirEntry.mValid     = false;
     outDirEntry.mDirHandle = nullptr;
     outDirEntry.mFilename[0]      = '\0';
     outDirEntry.mDirectoryPath[0] = '\0';
+
+    const std::string romPath = ToRomPath(dirPath.c_str());
+    // libdragon's dir_findfirst wants a trailing slash on the path.
+    std::string queryPath = romPath;
+    if (queryPath.empty() || queryPath.back() != '/') queryPath += '/';
+
+    N64DirIter* it = new N64DirIter();
+    it->mPath = queryPath;
+    const int rc = dir_findfirst(queryPath.c_str(), &it->mDir);
+    if (rc != 0)
+    {
+        // Empty directory or doesn't exist. Caller bails cleanly on
+        // mValid=false.
+        delete it;
+        return;
+    }
+    it->mPrimed = true;
+    outDirEntry.mDirHandle = it;
+
+    std::strncpy(outDirEntry.mDirectoryPath, dirPath.c_str(), MAX_PATH_SIZE);
+    outDirEntry.mDirectoryPath[MAX_PATH_SIZE] = '\0';
+    outDirEntry.mValid = true;
+
+    // Prime: copy the first entry's name into outDirEntry so the engine
+    // sees it on the very first iteration. Subsequent SYS_IterateDirectory
+    // calls advance via dir_findnext.
+    std::strncpy(outDirEntry.mLastName, it->mDir.d_name, sizeof(outDirEntry.mLastName) - 1);
+    outDirEntry.mLastName[sizeof(outDirEntry.mLastName) - 1] = '\0';
+    std::strncpy(outDirEntry.mFilename, it->mDir.d_name, MAX_PATH_SIZE);
+    outDirEntry.mFilename[MAX_PATH_SIZE] = '\0';
+    outDirEntry.mDirectory = (it->mDir.d_type == DT_DIR);
 }
 
 void SYS_IterateDirectory(DirEntry& dirEntry)
 {
-    dirEntry.mValid = false;
+    N64DirIter* it = static_cast<N64DirIter*>(dirEntry.mDirHandle);
+    if (!dirEntry.mValid || it == nullptr)
+    {
+        dirEntry.mValid = false;
+        return;
+    }
+
+    // First call after OpenDirectory just consumes the primed entry; no
+    // findnext yet.
+    if (it->mPrimed)
+    {
+        it->mPrimed = false;
+        return;
+    }
+
+    const int rc = dir_findnext(it->mPath.c_str(), &it->mDir);
+    if (rc != 0)
+    {
+        dirEntry.mValid = false;
+        return;
+    }
+
+    std::strncpy(dirEntry.mLastName, it->mDir.d_name, sizeof(dirEntry.mLastName) - 1);
+    dirEntry.mLastName[sizeof(dirEntry.mLastName) - 1] = '\0';
+    std::strncpy(dirEntry.mFilename, it->mDir.d_name, MAX_PATH_SIZE);
+    dirEntry.mFilename[MAX_PATH_SIZE] = '\0';
+    dirEntry.mDirectory = (it->mDir.d_type == DT_DIR);
 }
 
 void SYS_CloseDirectory(DirEntry& dirEntry)
 {
-    dirEntry.mDirHandle = nullptr;
-    dirEntry.mValid     = false;
+    N64DirIter* it = static_cast<N64DirIter*>(dirEntry.mDirHandle);
+    if (it != nullptr)
+    {
+        delete it;
+        dirEntry.mDirHandle = nullptr;
+    }
+    dirEntry.mValid = false;
 }
 
 void SYS_CopyFile(const char* sourcePath, const char* destPath)

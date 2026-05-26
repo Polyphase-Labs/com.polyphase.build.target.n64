@@ -227,12 +227,18 @@ OBJS  := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
 DEFINES := \
     -DPOLYPHASE_PLATFORM_ADDON=1 \
     -DPLATFORM_N64=1 \
+    -DPOLYPHASE_BIG_ENDIAN=1 \
     -DAPI_T3D=1 \
     -DEDITOR=0 \
     -DLUA_ENABLED=1 \
     -DGLM_FORCE_RADIANS \
     -DLOGGING_ENABLED=1 \
     $(ADDON_DEFINES)
+# POLYPHASE_BIG_ENDIAN tells engine code (Stream<T>, Scene.cpp, StaticMesh3d.cpp)
+# to byte-swap multi-byte values when reading/writing asset .oct files.
+# Editor cooks on Windows (little-endian) but N64 is big-endian — without
+# the swap, asset type IDs decode reversed and AssetManager can't find
+# the corresponding factory ("no factory for type=X" errors).
 ifeq ($(strip $(N64_EXPANSION_PAK)),1)
 DEFINES += -DN64_EXPANSION_PAK=1
 endif

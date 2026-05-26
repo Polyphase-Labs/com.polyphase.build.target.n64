@@ -74,6 +74,12 @@ namespace
     // engine's main loop is ticking.
     static uint32_t sFrameCount = 0;
 
+    // Per-second draw counters (reset each summary). Bumped from
+    // GFX_BeginRenderPass and GFX_DrawStaticMeshComp; reported from
+    // GFX_EndFrame at the 60-frame boundary.
+    static uint32_t sBeginRenderPassCount = 0;
+    static uint32_t sDrawStaticMeshCompCount = 0;
+
     // Z-buffer for 3D rendering. Allocated lazily on first GFX_BeginFrame
     // to keep the boot path lean. 16-bit Z is the N64-native depth format
     // (FMT_RGBA16 used as a depth surface — libdragon convention).
@@ -85,7 +91,7 @@ namespace
     // before any engine GFX_DrawStaticMeshComp gets wired up. Disable once
     // engine mesh rendering is fully integrated. Visible as a small
     // gradient triangle in the top-left.
-    constexpr bool kDrawTestTriangle = true;
+    constexpr bool kDrawTestTriangle = false;
 
     // 32x32 procedural checkerboard texture used by the test triangle.
     // RGBA16 (5-5-5-1) format = 2 bytes per texel = 2 KB total (well
@@ -294,6 +300,14 @@ void GFX_EndFrame()
         DrawTestCube();
     }
 
+    if ((sFrameCount % 60) == 1)
+    {
+        debugf("[GFX] EndFrame summary: BeginRenderPass=%u DrawStaticMeshComp=%u\n",
+               sBeginRenderPassCount, sDrawStaticMeshCompCount);
+        sBeginRenderPassCount = 0;
+        sDrawStaticMeshCompCount = 0;
+    }
+
     rdpq_detach_show();
     sActiveSurface = nullptr;
 }
@@ -303,7 +317,15 @@ void GFX_BeginView(uint32_t /*viewIndex*/) {}
 
 bool GFX_ShouldCullLights() { return false; }
 
-void GFX_BeginRenderPass(RenderPassId /*renderPassId*/) {}
+void GFX_BeginRenderPass(RenderPassId renderPassId)
+{
+    sBeginRenderPassCount++;
+    if ((sFrameCount % 60) == 1)
+    {
+        debugf("[GFX] BeginRenderPass(%d) count=%u (frame %u)\n",
+               (int)renderPassId, sBeginRenderPassCount, sFrameCount);
+    }
+}
 void GFX_EndRenderPass() {}
 void GFX_SetPipelineState(PipelineConfig /*config*/) {}
 
@@ -575,13 +597,33 @@ void GFX_UpdateStaticMeshCompResourceColors(StaticMesh3D* /*staticMeshComp*/) {}
 
 void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverride)
 {
-    if (staticMeshComp == nullptr || sActiveSurface == nullptr) return;
+    sDrawStaticMeshCompCount++;
+    // Per-frame trace gated to first call of every 60th frame.
+    static uint32_t sLastTraceFrame = 0xFFFFFFFF;
+    const bool kTraceThisCall = ((sFrameCount % 60) == 1) && (sFrameCount != sLastTraceFrame);
+    if (kTraceThisCall) sLastTraceFrame = sFrameCount;
+
+    if (staticMeshComp == nullptr || sActiveSurface == nullptr)
+    {
+        if (kTraceThisCall) debugf("[GFX] DrawStaticMeshComp: bailing — comp=%p surf=%p\n",
+                                   (void*)staticMeshComp, (void*)sActiveSurface);
+        return;
+    }
 
     StaticMesh* mesh = meshOverride ? meshOverride : staticMeshComp->GetStaticMesh();
-    if (mesh == nullptr) return;
+    if (mesh == nullptr)
+    {
+        if (kTraceThisCall) debugf("[GFX] DrawStaticMeshComp: mesh==null\n");
+        return;
+    }
 
     StaticMeshResource* meshRes = mesh->GetResource();
-    if (meshRes->mVertexData == nullptr || meshRes->mIndexData == nullptr) return;
+    if (meshRes->mVertexData == nullptr || meshRes->mIndexData == nullptr)
+    {
+        if (kTraceThisCall) debugf("[GFX] DrawStaticMeshComp: meshRes empty (vd=%p id=%p)\n",
+                                   meshRes->mVertexData, (void*)meshRes->mIndexData);
+        return;
+    }
     if (meshRes->mNumIndices < 3) return;
 
     // Camera matrices. Cache per-frame; the same camera will be the active
@@ -590,7 +632,18 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverri
     if (!sViewProjValid)
     {
         UpdateCameraCache(staticMeshComp->GetWorld());
-        if (!sViewProjValid) return;
+        if (!sViewProjValid)
+        {
+            if (kTraceThisCall) debugf("[GFX] DrawStaticMeshComp: viewProj invalid (no camera?)\n");
+            return;
+        }
+    }
+
+    if (kTraceThisCall)
+    {
+        debugf("[GFX] DrawStaticMeshComp: drawing %u tris, hasTex=%d\n",
+               (unsigned)(meshRes->mNumIndices / 3),
+               (int)(staticMeshComp->GetMaterial() != nullptr));
     }
 
     const glm::mat4 model = staticMeshComp->GetTransform();

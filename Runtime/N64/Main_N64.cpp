@@ -38,6 +38,19 @@
 extern uint32_t gNumEmbeddedScripts;
 extern EmbeddedFile gEmbeddedScripts[];
 
+// Static-init probe. If this counter is > 0 by the time main() runs,
+// global C++ constructors are firing (which means asset factory statics
+// should be registering too). If it stays 0, --gc-sections or libdragon's
+// __do_global_ctors wrap is killing static init.
+static volatile int sStaticInitCount = 0;
+struct StaticInitProbe
+{
+    StaticInitProbe() { sStaticInitCount++; }
+};
+static StaticInitProbe sStaticInitProbe_a;
+static StaticInitProbe sStaticInitProbe_b;
+static StaticInitProbe sStaticInitProbe_c;
+
 // -------------------------------------------------------------------------
 // Oct* hooks — minimal stubs.
 // -------------------------------------------------------------------------
@@ -108,7 +121,8 @@ int main(void)
     // calls work because the macros expand fully without scope conflicts.
     debug_init_isviewer();
     debug_init_usblog();  // libdragon's USB-debug sink — `debug_init_usb` is the older name.
-    debugf("[1] Polyphase N64 boot start\n");
+    debugf("[1] Polyphase N64 boot start (static ctors fired: %d / expected 3)\n",
+           sStaticInitCount);
 
     // Display: 320x240 RGBA16, double-buffered, no AA. RGBA16 is the cheapest
     // mode that gives reasonable color depth on N64; RGBA32 doubles VRAM cost.
@@ -123,6 +137,38 @@ int main(void)
     if (dfsRc == DFS_ESUCCESS)
     {
         debugf("[3] DragonFS mounted\n");
+
+        // Debug: walk one level of rom:/ so we can see what mkdfs actually
+        // put in there. Useful for diagnosing path mismatches between what
+        // the engine queries and what's actually in the DFS.
+        dir_t d;
+        const int dfr = dir_findfirst("rom:/", &d);
+        if (dfr == 0)
+        {
+            debugf("[3a] DragonFS root contents:\n");
+            do {
+                debugf("       %s%s\n", d.d_name, (d.d_type == DT_DIR) ? "/" : "");
+            } while (dir_findnext("rom:/", &d) == 0);
+        }
+        else
+        {
+            debugf("[3a] dir_findfirst('rom:/') failed: %d\n", dfr);
+        }
+
+        // Also walk rom:/BuildTarget-N64/ since that's where the engine
+        // expects to find .octp and Config.ini.
+        const int dfr2 = dir_findfirst("rom:/BuildTarget-N64/", &d);
+        if (dfr2 == 0)
+        {
+            debugf("[3b] DragonFS rom:/BuildTarget-N64/ contents:\n");
+            do {
+                debugf("       %s%s\n", d.d_name, (d.d_type == DT_DIR) ? "/" : "");
+            } while (dir_findnext("rom:/BuildTarget-N64/", &d) == 0);
+        }
+        else
+        {
+            debugf("[3b] dir_findfirst('rom:/BuildTarget-N64/') failed: %d\n", dfr2);
+        }
     }
     else
     {

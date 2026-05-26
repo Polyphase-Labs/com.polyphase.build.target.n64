@@ -694,30 +694,140 @@ namespace
     {
         if (ctx == nullptr || ctx->packageOutputDir == nullptr || ctx->projectName == nullptr) return 0;
 
-        const std::string outDir = ctx->packageOutputDir;
+        const std::string outDir       = ctx->packageOutputDir;
+        const std::string projectName  = ctx->projectName;
+        const std::string projectDir   = ctx->projectDir ? ctx->projectDir : "";
 
-        // Rewrite both packaged Config.ini copies so the N64 runtime always
-        // boots with the native 320x240 logical viewport. N64 has only one
-        // canonical video mode for homebrew (NTSC 320x240); PAL is 320x288
-        // but most homebrew sticks with NTSC pixels. Override is silent and
-        // non-configurable — the option to switch is via Region, which the
-        // ROM header reflects but doesn't change the framebuffer dims.
+        // (1) Patch Config.ini to N64 native 320x240.
         ForceN64WindowSizeInConfig(outDir + "/Config.ini");
-        ForceN64WindowSizeInConfig(outDir + "/" + std::string(ctx->projectName) + "/Config.ini");
+        ForceN64WindowSizeInConfig(outDir + "/" + projectName + "/Config.ini");
         if (ctx->Log != nullptr)
         {
             ctx->Log(POLYPHASE_BT_LOG_DEBUG, "Patched WindowWidth/Height to 320/240 in packaged Config.ini");
         }
 
-        // The .z64 itself was already produced by Makefile_N64's stage:
-        // target (objcopy -O binary + n64tool + chksum64). The engine
-        // packager just copied it into packageOutputDir verbatim — no
-        // further wrapping needed here.
+        // (2) Bundle cooked assets / scripts / config into a DragonFS image
+        //     and re-pack the ROM with ELF + sym + DFS via n64tool.
+        //
+        // Makefile_N64's `stage` target produced a bare-ELF .z64 in
+        // <projectDir>/Build/N64/<projectName>.z64 which the engine just
+        // copied here. That ROM has no asset payload — the engine's
+        // AssetManager finds nothing at runtime and `No default scene
+        // found` is the symptom. To fix, build a .dfs from <outDir> (which
+        // already contains the cooked project tree under <projectName>/)
+        // and re-wrap ELF + sym + DFS into a new .z64 that replaces the
+        // bare one.
+        bool useWsl = ReadBoolOption(ctx, kUseWslKey, false);
+        std::string n64Inst = ResolveN64Inst(ctx, useWsl);
+
+        // Auto-fallback same as GetCompileCommand — if Windows-side N64_INST
+        // doesn't have libdragon but WSL does, switch transparently.
+#if defined(_WIN32)
+        if (!useWsl
+            && ReadOption(ctx, kN64InstPathKey, "").empty()
+            && !LibdragonReadyAtWindowsPath(n64Inst)
+            && LibdragonReadyInsideWsl())
+        {
+            useWsl = true;
+            n64Inst = "/opt/libdragon";
+        }
+#endif
+
+        const std::string intermediate = projectDir + "/Intermediate/N64";
+        const std::string elfStripped  = intermediate + "/" + projectName + ".elf.stripped";
+        const std::string elfSym       = intermediate + "/" + projectName + ".elf.sym";
+        const std::string dfsOut       = intermediate + "/" + projectName + ".dfs";
+        // mkdfs roots at packageOutputDir (NOT the project subdir) so files
+        // inside the DFS are addressable at exactly the paths the engine
+        // queries: "<projectName>/<projectName>.octp", "<projectName>/Assets/...",
+        // and the root-level "Config.ini". Rooting at the project subdir
+        // strips the <projectName>/ prefix and the engine can't find anything.
+        const std::string dfsRoot      = outDir;
+        const std::string z64Out       = outDir + "/" + projectName + ".z64";
+
+        const std::string title  = ReadOption(ctx, kTitleKey,  kTitleDefault);
+        const std::string romSize = "32M";  // matches Makefile_N64 default
+
+        auto quoteForBash = [](const std::string& s) {
+            std::string out = "'";
+            for (char c : s) { if (c == '\'') out += "'\\''"; else out += c; }
+            out += '\''; return out;
+        };
+
+        // Build the shell body. Two phases: mkdfs, then n64tool. Chained
+        // with `&&` so the n64tool step only runs if mkdfs succeeded.
+        std::string body;
+#if defined(_WIN32)
+        const bool useBashShell = useWsl;
+#else
+        const bool useBashShell = true;
+#endif
+        const std::string titleArg = useBashShell
+            ? quoteForBash(title)
+            : std::string("\"") + title + "\"";
+
+        if (useBashShell)
+        {
+            body =
+                "echo '[N64 PostPackage] Removing bare-ELF .z64 from DFS root...' && " +
+                std::string("rm -f ") + ShellPath(z64Out, useWsl) + " && " +
+                "echo '[N64 PostPackage] Bundling DragonFS...' && " +
+                ShellPath(n64Inst + "/bin/mkdfs", useWsl) + " " +
+                ShellPath(dfsOut, useWsl) + " " + ShellPath(dfsRoot, useWsl) + " >/dev/null && " +
+                "echo '[N64 PostPackage] Re-wrapping ROM with ELF + sym + DFS...' && " +
+                ShellPath(n64Inst + "/bin/n64tool", useWsl) +
+                " --title " + titleArg +
+                " -l " + romSize +
+                " --toc" +
+                " --output " + ShellPath(z64Out, useWsl) +
+                " --align 256 " + ShellPath(elfStripped, useWsl) +
+                " --align 8 "   + ShellPath(elfSym,      useWsl) +
+                " --align 16 "  + ShellPath(dfsOut,      useWsl);
+        }
+        else
+        {
+            // Windows-native CMD. Same logical steps.
+            body =
+                "echo [N64 PostPackage] Removing bare-ELF .z64 from DFS root... && " +
+                std::string("del /q ") + ShellPath(z64Out, false) + " >nul 2>&1 & " +
+                "echo [N64 PostPackage] Bundling DragonFS... && " +
+                ShellPath(n64Inst + "/bin/mkdfs", false) + " " +
+                ShellPath(dfsOut, false) + " " + ShellPath(dfsRoot, false) + " >nul && " +
+                "echo [N64 PostPackage] Re-wrapping ROM with ELF + sym + DFS... && " +
+                ShellPath(n64Inst + "/bin/n64tool", false) +
+                " --title " + titleArg +
+                " -l " + romSize +
+                " --toc" +
+                " --output " + ShellPath(z64Out, false) +
+                " --align 256 " + ShellPath(elfStripped, false) +
+                " --align 8 "   + ShellPath(elfSym,      false) +
+                " --align 16 "  + ShellPath(dfsOut,      false);
+        }
+
+        const std::string cmd = WrapShell(ctx, body, useWsl, n64Inst);
+        if (ctx->WriteOutputLine != nullptr) ctx->WriteOutputLine(cmd.c_str());
+        const int rc = std::system(cmd.c_str());
+        if (rc != 0)
+        {
+            if (ctx->Log != nullptr)
+            {
+                char msg[512];
+                std::snprintf(msg, sizeof(msg),
+                    "N64 PostPackage: mkdfs/n64tool failed (rc=%d). ROM left as bare-ELF; engine will run with no on-disk assets.",
+                    rc);
+                ctx->Log(POLYPHASE_BT_LOG_WARNING, msg);
+            }
+            // Non-fatal: the bare-ELF .z64 still boots, just without assets.
+            // Returning 0 would mark the whole package as failed, which is
+            // too aggressive when this only affects asset availability.
+            return 1;
+        }
+
         if (ctx->Log != nullptr)
         {
             char ok[512];
             std::snprintf(ok, sizeof(ok),
-                "N64 package complete: %s/%s.z64",
+                "N64 package complete with DragonFS: %s/%s.z64",
                 outDir.c_str(), ctx->projectName);
             ctx->Log(POLYPHASE_BT_LOG_DEBUG, ok);
         }
