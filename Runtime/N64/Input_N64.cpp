@@ -31,7 +31,6 @@
 
 void INP_Initialize()
 {
-    ::debugf("[INP] Entered INP_Initialize\n");
     // controller_init is called from Main_N64.cpp's boot — we just configure
     // the engine state to expect input.
     InputState& input = GetEngineState()->mInput;
@@ -40,7 +39,7 @@ void INP_Initialize()
     input.mNumControllers = 1;
 
     InputInit();
-    LogDebug("Input_N64: joypad initialised (Phase 1: stub mapping)");
+    LogDebug("Input_N64: joypad initialised");
 }
 
 void INP_Shutdown()

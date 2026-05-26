@@ -59,7 +59,6 @@ void SYS_Initialize()
 
     sInitialized = true;
     LogDebug("System_N64: initialised");
-    debugf("[SYS] SYS_Initialize returning\n");
 }
 
 void SYS_Shutdown()

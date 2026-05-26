@@ -23,7 +23,6 @@
 
 void NET_Initialize()
 {
-    debugf("[NET] Entered NET_Initialize (stub)\n");
     LogDebug("Network_N64: stock N64 has no network - NET_* stubbed");
 }
 

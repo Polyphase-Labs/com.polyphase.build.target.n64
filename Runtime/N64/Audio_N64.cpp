@@ -28,8 +28,7 @@
 
 void AUD_Initialize()
 {
-    debugf("[AUD] Entered AUD_Initialize (silent stub)\n");
-    LogDebug("Audio_N64: silent stub (Phase 1)");
+    LogDebug("Audio_N64: silent stub");
 }
 
 void AUD_Shutdown() {}

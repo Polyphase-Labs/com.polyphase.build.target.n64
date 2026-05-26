@@ -61,24 +61,11 @@ namespace
     // (between BeginFrame and EndFrame) and release it on swap.
     surface_t* sActiveSurface = nullptr;
 
-    // Clear color — Phase 1 picks bright magenta so you can visually
-    // confirm GFX_BeginFrame/EndFrame are running each frame. A black
-    // screen would be ambiguous (could be a hang BEFORE rendering, the
-    // bootloader's idle screen, or actually-working). Magenta is
-    // unmistakable. Phase 3 swaps this for a Renderer-supplied clear.
-    constexpr color_t kClearColor = { 0xFF, 0x00, 0xFF, 0xFF };
+    constexpr color_t kClearColor = { 0x00, 0x00, 0x00, 0xFF };
 
-    // Frame counter so we can sanity-check "rendering" by watching the
-    // color cycle. The clear color itself stays magenta; the counter is
-    // used to gate a per-frame ISViewer log line so the host knows the
-    // engine's main loop is ticking.
+    // Frame counter — drives the test-cube rotation animation when
+    // kDrawTestTriangle is enabled. Incremented once per GFX_BeginFrame.
     static uint32_t sFrameCount = 0;
-
-    // Per-second draw counters (reset each summary). Bumped from
-    // GFX_BeginRenderPass and GFX_DrawStaticMeshComp; reported from
-    // GFX_EndFrame at the 60-frame boundary.
-    static uint32_t sBeginRenderPassCount = 0;
-    static uint32_t sDrawStaticMeshCompCount = 0;
 
     // Z-buffer for 3D rendering. Allocated lazily on first GFX_BeginFrame
     // to keep the boot path lean. 16-bit Z is the N64-native depth format
@@ -133,13 +120,8 @@ namespace
 
 void GFX_Initialize()
 {
-    debugf("[GFX] Entered GFX_Initialize (before rdpq_init)\n");
-    // display_init / rdpq_init are called from Main_N64.cpp's boot. Engine-
-    // visible setup happens here. For Phase 1 there's nothing to do — the
-    // first BeginFrame will grab a surface and clear it.
     rdpq_init();
-    debugf("[GFX] rdpq_init returned\n");
-    LogDebug("Graphics_N64RDP: rdpq initialised (Phase 1 stub)");
+    LogDebug("Graphics_N64RDP: rdpq initialised");
 }
 
 void GFX_Shutdown()
@@ -164,8 +146,6 @@ void GFX_BeginFrame()
     {
         sZBuffer = surface_alloc(FMT_RGBA16, 320, 240);
         sZBufferReady = (sZBuffer.buffer != nullptr);
-        debugf("[GFX] z-buffer allocated: %dx%d (ready=%d)\n",
-               sZBuffer.width, sZBuffer.height, (int)sZBufferReady);
     }
 
     // Pull a framebuffer to render into. display_get blocks until VBlank
@@ -182,12 +162,7 @@ void GFX_BeginFrame()
         rdpq_clear_z(0xFFFC);
     }
 
-    // Log every ~60th frame so ISViewer/USB shows the engine is alive
-    // without spamming the channel at 60 Hz.
-    if ((sFrameCount++ % 60) == 0)
-    {
-        debugf("[GFX] frame %u\n", (unsigned)sFrameCount);
-    }
+    sFrameCount++;
 }
 
 // Helper: draw a spinning, perspective-correct, depth-tested,
@@ -300,14 +275,6 @@ void GFX_EndFrame()
         DrawTestCube();
     }
 
-    if ((sFrameCount % 60) == 1)
-    {
-        debugf("[GFX] EndFrame summary: BeginRenderPass=%u DrawStaticMeshComp=%u\n",
-               sBeginRenderPassCount, sDrawStaticMeshCompCount);
-        sBeginRenderPassCount = 0;
-        sDrawStaticMeshCompCount = 0;
-    }
-
     rdpq_detach_show();
     sActiveSurface = nullptr;
 }
@@ -317,15 +284,7 @@ void GFX_BeginView(uint32_t /*viewIndex*/) {}
 
 bool GFX_ShouldCullLights() { return false; }
 
-void GFX_BeginRenderPass(RenderPassId renderPassId)
-{
-    sBeginRenderPassCount++;
-    if ((sFrameCount % 60) == 1)
-    {
-        debugf("[GFX] BeginRenderPass(%d) count=%u (frame %u)\n",
-               (int)renderPassId, sBeginRenderPassCount, sFrameCount);
-    }
-}
+void GFX_BeginRenderPass(RenderPassId /*renderPassId*/) {}
 void GFX_EndRenderPass() {}
 void GFX_SetPipelineState(PipelineConfig /*config*/) {}
 
@@ -597,33 +556,13 @@ void GFX_UpdateStaticMeshCompResourceColors(StaticMesh3D* /*staticMeshComp*/) {}
 
 void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverride)
 {
-    sDrawStaticMeshCompCount++;
-    // Per-frame trace gated to first call of every 60th frame.
-    static uint32_t sLastTraceFrame = 0xFFFFFFFF;
-    const bool kTraceThisCall = ((sFrameCount % 60) == 1) && (sFrameCount != sLastTraceFrame);
-    if (kTraceThisCall) sLastTraceFrame = sFrameCount;
-
-    if (staticMeshComp == nullptr || sActiveSurface == nullptr)
-    {
-        if (kTraceThisCall) debugf("[GFX] DrawStaticMeshComp: bailing — comp=%p surf=%p\n",
-                                   (void*)staticMeshComp, (void*)sActiveSurface);
-        return;
-    }
+    if (staticMeshComp == nullptr || sActiveSurface == nullptr) return;
 
     StaticMesh* mesh = meshOverride ? meshOverride : staticMeshComp->GetStaticMesh();
-    if (mesh == nullptr)
-    {
-        if (kTraceThisCall) debugf("[GFX] DrawStaticMeshComp: mesh==null\n");
-        return;
-    }
+    if (mesh == nullptr) return;
 
     StaticMeshResource* meshRes = mesh->GetResource();
-    if (meshRes->mVertexData == nullptr || meshRes->mIndexData == nullptr)
-    {
-        if (kTraceThisCall) debugf("[GFX] DrawStaticMeshComp: meshRes empty (vd=%p id=%p)\n",
-                                   meshRes->mVertexData, (void*)meshRes->mIndexData);
-        return;
-    }
+    if (meshRes->mVertexData == nullptr || meshRes->mIndexData == nullptr) return;
     if (meshRes->mNumIndices < 3) return;
 
     // Camera matrices. Cache per-frame; the same camera will be the active
@@ -632,50 +571,49 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* staticMeshComp, StaticMesh* meshOverri
     if (!sViewProjValid)
     {
         UpdateCameraCache(staticMeshComp->GetWorld());
-        if (!sViewProjValid)
-        {
-            if (kTraceThisCall) debugf("[GFX] DrawStaticMeshComp: viewProj invalid (no camera?)\n");
-            return;
-        }
-    }
-
-    if (kTraceThisCall)
-    {
-        debugf("[GFX] DrawStaticMeshComp: drawing %u tris, hasTex=%d\n",
-               (unsigned)(meshRes->mNumIndices / 3),
-               (int)(staticMeshComp->GetMaterial() != nullptr));
+        if (!sViewProjValid) return;
     }
 
     const glm::mat4 model = staticMeshComp->GetTransform();
     const glm::mat4 mvp   = sViewProj * model;
 
-    // Optional texture. Material may be the base type — convert to
-    // MaterialLite via Material::AsLite (same pattern PSP uses) to call
-    // GetTexture(slot). MaterialInstance / other types fall back to null.
+    // Material → texture + base color. MaterialInstance forwards through
+    // its MaterialBase, which (if MaterialLite) exposes GetTexture and
+    // GetColor. Anything else falls back to white.
     Material* matBase = staticMeshComp->GetMaterial();
     MaterialLite* mat = Material::AsLite(matBase);
     Texture*  tex     = (mat != nullptr) ? mat->GetTexture(0) : nullptr;
     TextureResource* texRes = (tex != nullptr) ? tex->GetResource() : nullptr;
 
+    glm::vec4 matColor = (mat != nullptr) ? mat->GetColor() : glm::vec4(1.0f);
+    matColor = glm::clamp(matColor, 0.0f, 1.0f);
+    const uint8_t cr = (uint8_t)(matColor.r * 255.0f);
+    const uint8_t cg = (uint8_t)(matColor.g * 255.0f);
+    const uint8_t cb = (uint8_t)(matColor.b * 255.0f);
+    const uint8_t ca = (uint8_t)(matColor.a * 255.0f);
+
     if (texRes != nullptr && texRes->mPixels != nullptr && texRes->mWidth > 0)
     {
-        // Build a surface_t on the fly pointing at our cached RGBA16
-        // pixels and upload to TMEM. surface_t is a small POD; stack
-        // allocation is fine.
+        // Textured: prim_color modulates the texture sample.
         surface_t surf = surface_make_linear(texRes->mPixels, FMT_RGBA16,
                                              texRes->mWidth, texRes->mHeight);
         rdpq_set_mode_standard();
-        rdpq_mode_zbuf(true, true);             // z read + write
-        rdpq_mode_persp(true);                  // perspective-correct texture
+        rdpq_mode_zbuf(true, true);
+        rdpq_mode_persp(true);
         rdpq_mode_filter(FILTER_BILINEAR);
         rdpq_tex_upload(TILE0, &surf, NULL);
+        rdpq_set_prim_color(RGBA32(cr, cg, cb, ca));
     }
     else
     {
-        // No texture — solid-color triangle (white).
+        // Untextured: flat-shaded with the material's color. The FLAT
+        // combiner outputs prim_color directly — without it, the default
+        // standard combiner tries to multiply by a texture sample that
+        // isn't bound and produces garbage.
         rdpq_set_mode_standard();
         rdpq_mode_zbuf(true, true);
-        rdpq_set_prim_color(RGBA32(255, 255, 255, 255));
+        rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
+        rdpq_set_prim_color(RGBA32(cr, cg, cb, ca));
     }
 
     // Software vertex transform. Build the screen-space + UV + 1/w array
