@@ -832,14 +832,18 @@ void GFX_RenderPostProcessPasses() {}
 #include "Engine/Nodes/3D/TileMap2d.h"
 #include "Engine/Nodes/3D/Voxel3d.h"
 
-glm::mat4 GFX_MakePerspectiveMatrix(float /*fovyDegrees*/, float /*aspectRatio*/, float /*zNear*/, float /*zFar*/)
+glm::mat4 GFX_MakePerspectiveMatrix(float fovyDegrees, float aspectRatio, float zNear, float zFar)
 {
-    return glm::mat4(1.0f);
+    // OpenGL-convention perspective (NDC z in [-1, 1], +Y up). Our software
+    // vertex transform in GFX_DrawStaticMeshComp expects this — it converts
+    // NDC->screen with `sy = (1 - (ndc_y * 0.5 + 0.5)) * H` (flips +Y up to
+    // +Y down) and `sz = (ndc_z * 0.5 + 0.5)` (maps z to [0, 1]).
+    return glm::perspective(glm::radians(fovyDegrees), aspectRatio, zNear, zFar);
 }
 
-glm::mat4 GFX_MakeOrthographicMatrix(float /*left*/, float /*right*/, float /*bottom*/, float /*top*/, float /*zNear*/, float /*zFar*/)
+glm::mat4 GFX_MakeOrthographicMatrix(float left, float right, float bottom, float top, float zNear, float zFar)
 {
-    return glm::mat4(1.0f);
+    return glm::ortho(left, right, bottom, top, zNear, zFar);
 }
 
 // =========================================================================
